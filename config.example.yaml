@@ -1,0 +1,18 @@
+# Copy this to config.yaml on the GCE box and fill in the real values, then:
+#   chmod 600 config.yaml      # it holds your Twilio secrets — keep it private
+# Do NOT commit config.yaml anywhere.
+
+twilio:
+  account_sid: "ACxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"   # from Twilio console
+  auth_token:  "your_auth_token"
+  from_number: "+15551234567"                          # your Twilio number
+  to_number:   "+15145551234"                          # Ted's mobile
+
+healthcheck:
+  # Create a free check at https://healthchecks.io, set its period to ~10 min,
+  # and paste its ping URL here. If the monitor stops pinging, it emails you.
+  ping_url: "https://hc-ping.com/your-uuid-here"
+
+defaults:
+  timeout_seconds: 10       # per-check timeout
+  failure_threshold: 2      # consecutive failures before an SMS fires (anti-flapping)

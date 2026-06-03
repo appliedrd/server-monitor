@@ -1,0 +1,18 @@
+# Secrets — NEVER commit (holds the Twilio auth token)
+config.yaml
+
+# Deployment-specific target list — each operator keeps their own
+servers.yaml
+
+# Operator's private deployment notes (kept out of the public repo)
+server_monitor.md
+
+# Runtime artifacts
+state.json
+*.log
+
+# Python
+venv/
+__pycache__/
+*.pyc
+.env

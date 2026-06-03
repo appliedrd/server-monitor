@@ -1,0 +1,28 @@
+# Copy this to servers.yaml and edit for your own targets:
+#   cp servers.example.yaml servers.yaml
+#
+# Two check types:
+#   type: http  -> needs `url`; optional `expect_status` (int or list, default [200,301,302])
+#   type: tcp   -> needs `host` + `port`
+# `name` is what shows up in the SMS / log.
+
+servers:
+  - name: Example website
+    type: http
+    url: https://example.com
+    expect_status: [200, 301, 302]
+
+  - name: Example API health endpoint
+    type: http
+    url: https://api.example.com/health
+    expect_status: [200]
+
+  - name: Example SSH
+    type: tcp
+    host: 203.0.113.10
+    port: 22
+
+  # - name: Example database
+  #   type: tcp
+  #   host: db.internal
+  #   port: 5432
