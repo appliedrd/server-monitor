@@ -16,3 +16,5 @@ healthcheck:
 defaults:
   timeout_seconds: 10       # per-check timeout
   failure_threshold: 2      # consecutive failures before an SMS fires (anti-flapping)
+  timezone: "UTC"           # display tz for logs + the daily summary, e.g. "America/Montreal".
+                            # Display only — does NOT change the host clock or when cron fires.

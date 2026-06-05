@@ -1,3 +1,4 @@
 twilio
 requests
 pyyaml
+tzdata   # ensures zoneinfo has timezone data even if the OS lacks it

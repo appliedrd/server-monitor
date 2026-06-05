@@ -29,19 +29,42 @@ from pathlib import Path
 import requests
 import yaml
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover
+    ZoneInfo = None
+
 HERE = Path(__file__).resolve().parent
 CONFIG_FILE = HERE / "config.yaml"
 SERVERS_FILE = HERE / "servers.yaml"
 STATE_FILE = HERE / "state.json"
 
+DISPLAY_TZ = timezone.utc  # overridden by config defaults.timezone (display only)
 
-def now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+def now_label() -> str:
+    """Current time as 'YYYY-MM-DD HH:MM TZ' in the configured display timezone."""
+    return datetime.now(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M %Z")
 
 
 def log(msg: str) -> None:
     """Timestamped line to stdout (cron redirects this to monitor.log)."""
-    print(f"{now_iso()}Z  {msg}", flush=True)
+    print(f"{now_label()}  {msg}", flush=True)
+
+
+def set_display_tz(cfg: dict) -> None:
+    """Set the display timezone from config (does not touch the host clock)."""
+    global DISPLAY_TZ
+    name = (cfg.get("defaults") or {}).get("timezone")
+    if not name:
+        return
+    if ZoneInfo is None:
+        log("WARN: zoneinfo unavailable; using UTC for display")
+        return
+    try:
+        DISPLAY_TZ = ZoneInfo(name)
+    except Exception:  # noqa: BLE001
+        log(f"WARN: unknown timezone '{name}'; using UTC for display")
 
 
 def load_yaml(path: Path) -> dict:
@@ -134,7 +157,7 @@ def run_checks(cfg: dict, servers: list, state: dict) -> None:
     timeout = float(defaults.get("timeout_seconds", 10))
     threshold = int(defaults.get("failure_threshold", 2))
 
-    state.setdefault("_summary", {"since": now_iso()})
+    state.setdefault("_summary", {"since": now_label()})
 
     if not servers:
         log("WARN: no servers configured in servers.yaml")
@@ -196,7 +219,7 @@ def send_summary(cfg: dict, servers: list, state: dict) -> None:
     header = ("Server Monitor daily: all systems healthy"
               if all_ok else
               f"Server Monitor daily: {total_incidents} incident(s) in last 24h")
-    body = header + f"\n(since {since}Z)\n" + "\n".join(lines)
+    body = header + f"\n(since {since})\n" + "\n".join(lines)
     send_sms(cfg, body)
     log(f"daily summary sent ({total_incidents} incidents)")
 
@@ -205,7 +228,7 @@ def send_summary(cfg: dict, servers: list, state: dict) -> None:
         st = state.get(target_name(target))
         if st:
             st["day_checks"] = st["day_fails"] = st["day_incidents"] = 0
-    state["_summary"] = {"since": now_iso()}
+    state["_summary"] = {"since": now_label()}
     save_state(state)
 
 
@@ -213,6 +236,7 @@ def send_summary(cfg: dict, servers: list, state: dict) -> None:
 
 def main() -> None:
     cfg = load_yaml(CONFIG_FILE)
+    set_display_tz(cfg)
     servers = load_yaml(SERVERS_FILE).get("servers", [])
     state = load_state()
 
