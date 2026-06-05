@@ -102,10 +102,17 @@ def target_name(target: dict) -> str:
 def check_http(target: dict, timeout: float) -> tuple[bool, str]:
     url = target["url"]
     expected = target.get("expect_status", [200, 301, 302])
-    if isinstance(expected, int):
-        expected = [expected]
     try:
         r = requests.get(url, timeout=timeout, allow_redirects=False)
+        # "any" = reachability check: any HTTP response under 500 means the
+        # service answered (up). Use for third-party deps that return 401/403/
+        # 404/302 to bare requests. Only 5xx / connection failures are "down".
+        if isinstance(expected, str) and expected.lower() == "any":
+            if r.status_code < 500:
+                return True, f"HTTP {r.status_code} (reachable)"
+            return False, f"HTTP {r.status_code} (server error)"
+        if isinstance(expected, int):
+            expected = [expected]
         if r.status_code in expected:
             return True, f"HTTP {r.status_code}"
         return False, f"HTTP {r.status_code} (expected {expected})"

@@ -2,7 +2,11 @@
 #   cp servers.example.yaml servers.yaml
 #
 # Two check types:
-#   type: http  -> needs `url`; optional `expect_status` (int or list, default [200,301,302])
+#   type: http  -> needs `url`; optional `expect_status`:
+#                    - a list/int of acceptable codes (default [200,301,302]), or
+#                    - the string `any` = reachability check: any HTTP response
+#                      under 500 counts as up. Use for third-party APIs/CDNs that
+#                      answer 401/403/404/302 to bare requests but are still up.
 #   type: tcp   -> needs `host` + `port`
 # `name` is what shows up in the SMS / log.
 
