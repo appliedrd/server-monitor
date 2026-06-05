@@ -9,6 +9,10 @@ consecutive failures) and again when it RECOVERS. At the end of every run it
 pings a healthchecks.io URL as a dead-man's switch, so if this script or cron
 ever stops, healthchecks.io emails you.
 
+Each run also tallies per-site daily counters (checks / fails / incidents).
+Run once a day with --summary to text a digest and reset those counters:
+    venv/bin/python monitor.py --summary
+
 Deps (install into a venv — Debian 12 enforces PEP 668):
     python3 -m venv venv
     venv/bin/pip install twilio requests pyyaml
@@ -31,10 +35,13 @@ SERVERS_FILE = HERE / "servers.yaml"
 STATE_FILE = HERE / "state.json"
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
 def log(msg: str) -> None:
     """Timestamped line to stdout (cron redirects this to monitor.log)."""
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
-    print(f"{ts}  {msg}", flush=True)
+    print(f"{now_iso()}Z  {msg}", flush=True)
 
 
 def load_yaml(path: Path) -> dict:
@@ -60,6 +67,10 @@ def save_state(state: dict) -> None:
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(state, fh, indent=2)
     tmp.replace(STATE_FILE)  # atomic
+
+
+def target_name(target: dict) -> str:
+    return target.get("name") or target.get("url") or target.get("host", "?")
 
 
 # ---- checks ---------------------------------------------------------------
@@ -99,10 +110,10 @@ def run_check(target: dict, timeout: float) -> tuple[bool, str]:
 
 # ---- alerting -------------------------------------------------------------
 
-def send_sms(cfg: dict, body: str) -> None:
+def send_sms(cfg: dict, body: str, max_len: int = 700) -> None:
     tw = cfg.get("twilio", {})
-    if len(body) > 300:                 # keep SMS to ~2 segments; full detail stays in the log
-        body = body[:297] + "..."
+    if len(body) > max_len:             # safety ceiling; full detail stays in the log
+        body = body[:max_len - 3] + "..."
     try:
         from twilio.rest import Client
         client = Client(tw["account_sid"], tw["auth_token"])
@@ -112,38 +123,43 @@ def send_sms(cfg: dict, body: str) -> None:
         log(f"ERROR sending SMS: {e.__class__.__name__}: {e}")
 
 
-# ---- main -----------------------------------------------------------------
+def blank_counters() -> dict:
+    return {"fails": 0, "alerted": False, "day_checks": 0, "day_fails": 0, "day_incidents": 0}
 
-def main() -> None:
-    cfg = load_yaml(CONFIG_FILE)
-    servers = load_yaml(SERVERS_FILE).get("servers", [])
-    state = load_state()
 
+# ---- run modes ------------------------------------------------------------
+
+def run_checks(cfg: dict, servers: list, state: dict) -> None:
     defaults = cfg.get("defaults", {})
     timeout = float(defaults.get("timeout_seconds", 10))
     threshold = int(defaults.get("failure_threshold", 2))
+
+    state.setdefault("_summary", {"since": now_iso()})
 
     if not servers:
         log("WARN: no servers configured in servers.yaml")
 
     for target in servers:
-        name = target.get("name") or target.get("url") or target.get("host", "?")
+        name = target_name(target)
         ok, detail = run_check(target, timeout)
 
-        st = state.setdefault(name, {"fails": 0, "alerted": False})
+        st = state.setdefault(name, blank_counters())
+        st["day_checks"] = st.get("day_checks", 0) + 1
 
         if ok:
-            if st["alerted"]:
+            if st.get("alerted"):
                 send_sms(cfg, f"RECOVERED: {name} is back up ({detail}).")
             st["fails"] = 0
             st["alerted"] = False
             log(f"UP   {name} — {detail}")
         else:
-            st["fails"] += 1
+            st["fails"] = st.get("fails", 0) + 1
+            st["day_fails"] = st.get("day_fails", 0) + 1
             log(f"DOWN {name} — {detail} (consecutive fails: {st['fails']})")
-            if st["fails"] >= threshold and not st["alerted"]:
+            if st["fails"] >= threshold and not st.get("alerted"):
                 send_sms(cfg, f"DOWN: {name} failed {st['fails']}x — {detail}")
                 st["alerted"] = True
+                st["day_incidents"] = st.get("day_incidents", 0) + 1
 
     save_state(state)
 
@@ -155,6 +171,55 @@ def main() -> None:
             log("healthcheck ping sent")
         except requests.RequestException as e:
             log(f"WARN: healthcheck ping failed: {e}")
+
+
+def send_summary(cfg: dict, servers: list, state: dict) -> None:
+    since = state.get("_summary", {}).get("since", "?")
+    lines, total_incidents, all_ok = [], 0, True
+
+    for target in servers:
+        name = target_name(target)
+        st = state.get(name, {})
+        checks = st.get("day_checks", 0)
+        fails = st.get("day_fails", 0)
+        incidents = st.get("day_incidents", 0)
+        total_incidents += incidents
+        up = checks - fails
+        pct = (up / checks * 100) if checks else 0.0
+
+        if incidents or fails or st.get("alerted"):
+            all_ok = False
+        flag = " DOWN NOW" if st.get("alerted") else ""
+        extra = f", {incidents} incident(s)" if incidents else ""
+        lines.append(f"- {name}: {pct:.1f}% ({up}/{checks}){extra}{flag}")
+
+    header = ("Server Monitor daily: all systems healthy"
+              if all_ok else
+              f"Server Monitor daily: {total_incidents} incident(s) in last 24h")
+    body = header + f"\n(since {since}Z)\n" + "\n".join(lines)
+    send_sms(cfg, body)
+    log(f"daily summary sent ({total_incidents} incidents)")
+
+    # Reset the daily window.
+    for target in servers:
+        st = state.get(target_name(target))
+        if st:
+            st["day_checks"] = st["day_fails"] = st["day_incidents"] = 0
+    state["_summary"] = {"since": now_iso()}
+    save_state(state)
+
+
+# ---- main -----------------------------------------------------------------
+
+def main() -> None:
+    cfg = load_yaml(CONFIG_FILE)
+    servers = load_yaml(SERVERS_FILE).get("servers", [])
+    state = load_state()
+
+    if "--summary" in sys.argv[1:]:
+        send_summary(cfg, servers, state)
+    else:
+        run_checks(cfg, servers, state)
 
 
 if __name__ == "__main__":

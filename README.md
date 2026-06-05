@@ -38,6 +38,8 @@ See `DEPLOY.md` for the full runbook (cron, healthchecks.io).
 - At the end of each run it pings a [healthchecks.io](https://healthchecks.io) URL —
   a dead-man's switch so you're alerted if the monitor itself stops.
 - Designed to run from cron on an always-on host.
+- A daily digest (`monitor.py --summary`, scheduled separately) texts per-site
+  uptime % and any incidents over the last 24h, then resets the counters.
 
 ## License
 MIT — see [LICENSE](LICENSE).

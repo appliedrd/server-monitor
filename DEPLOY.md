@@ -46,6 +46,17 @@ crontab -l
 ```
 Use absolute paths in cron (as above) — cron has a minimal environment.
 
+### Daily summary (optional)
+Add a second cron line to text yourself a once-a-day digest (per-site uptime %
+and any incidents over the last 24h). Example at 07:00:
+```bash
+( crontab -l 2>/dev/null; echo "0 7 * * * $HOME/server-monitor/venv/bin/python $HOME/server-monitor/monitor.py --summary >> $HOME/server-monitor/monitor.log 2>&1" ) | crontab -
+```
+Note cron fires in the **host's timezone** (GCE default is UTC). Check with
+`date`; to get 07:00 local, adjust the hour (e.g. America/Montreal EDT = UTC-4,
+so use `0 11 * * *`). The summary reads counters accumulated by the 5-min runs,
+then resets them — so keep the regular `*/5` job running too.
+
 ## 6. Dead-man's switch (recommended)
 Create a free check at https://healthchecks.io (period ~5 min, grace ~3–5 min),
 paste its ping URL into `config.yaml` → `healthcheck.ping_url`. The monitor pings
