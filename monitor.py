@@ -21,6 +21,7 @@ Config: see config.yaml (secrets + defaults) and servers.yaml (targets).
 """
 
 import json
+import os
 import socket
 import sys
 from datetime import datetime, timezone
@@ -247,4 +248,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        # stdout was piped to a reader that closed early (e.g. `| head`).
+        # Harmless; never happens under cron (output goes to a file). Exit quietly.
+        try:
+            sys.stdout.close()
+        except Exception:  # noqa: BLE001
+            pass
+        os._exit(0)
