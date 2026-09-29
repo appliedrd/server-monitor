@@ -9,13 +9,19 @@ consecutive failures) and again when it RECOVERS. At the end of every run it
 pings a healthchecks.io URL as a dead-man's switch, so if this script or cron
 ever stops, healthchecks.io emails you.
 
-Each run also tallies per-site daily counters (checks / fails / incidents).
-Run once a day with --summary to text a digest and reset those counters:
+False alarms are kept down three ways:
+  - a failed check is retried once, 20 s later, before it counts;
+  - a site that connects but answers slowly (ReadTimeout) is "slow", not
+    "down", and only texts if it stays that way (slow_threshold);
+  - timeouts and thresholds can be set per target in servers.yaml.
+
+Each run also tallies per-site daily counters (checks / fails / slow /
+incidents). Run once a day with --summary to text a digest and reset them:
     venv/bin/python monitor.py --summary
 
 Deps (install into a venv — Debian 12 enforces PEP 668):
     python3 -m venv venv
-    venv/bin/pip install twilio requests pyyaml
+    venv/bin/pip install -r requirements.txt
 
 Config: see config.yaml (secrets + defaults) and servers.yaml (targets).
 """
@@ -24,6 +30,7 @@ import json
 import os
 import socket
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,6 +46,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG_FILE = HERE / "config.yaml"
 SERVERS_FILE = HERE / "servers.yaml"
 STATE_FILE = HERE / "state.json"
+LOG_FILE = HERE / "monitor.log"
 
 DISPLAY_TZ = timezone.utc  # overridden by config defaults.timezone (display only)
 
@@ -93,13 +101,30 @@ def save_state(state: dict) -> None:
     tmp.replace(STATE_FILE)  # atomic
 
 
+def trim_log(max_bytes: int) -> None:
+    """Keep monitor.log bounded without needing root for logrotate: past the
+    limit, move it to monitor.log.1 (replacing the old one). cron's >> opens a
+    fresh monitor.log on the next run."""
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size > max_bytes:
+            LOG_FILE.replace(LOG_FILE.with_suffix(".log.1"))
+    except OSError:
+        pass
+
+
 def target_name(target: dict) -> str:
     return target.get("name") or target.get("url") or target.get("host", "?")
 
 
-# ---- checks ---------------------------------------------------------------
+def setting(target: dict, defaults: dict, key: str, fallback):
+    """Per-target value, else the config default, else the built-in fallback."""
+    return target.get(key, defaults.get(key, fallback))
 
-def check_http(target: dict, timeout: float) -> tuple[bool, str]:
+
+# ---- checks ---------------------------------------------------------------
+# Each check returns (status, detail); status is "up", "slow" or "down".
+
+def check_http(target: dict, timeout: float) -> tuple[str, str]:
     url = target["url"]
     expected = target.get("expect_status", [200, 301, 302])
     try:
@@ -109,34 +134,51 @@ def check_http(target: dict, timeout: float) -> tuple[bool, str]:
         # 404/302 to bare requests. Only 5xx / connection failures are "down".
         if isinstance(expected, str) and expected.lower() == "any":
             if r.status_code < 500:
-                return True, f"HTTP {r.status_code} (reachable)"
-            return False, f"HTTP {r.status_code} (server error)"
+                return "up", f"HTTP {r.status_code} (reachable)"
+            return "down", f"HTTP {r.status_code} (server error)"
         if isinstance(expected, int):
             expected = [expected]
         if r.status_code in expected:
-            return True, f"HTTP {r.status_code}"
-        return False, f"HTTP {r.status_code} (expected {expected})"
+            return "up", f"HTTP {r.status_code}"
+        return "down", f"HTTP {r.status_code} (expected {expected})"
+    except requests.ReadTimeout:
+        # Connected, but no answer in time: a struggling site, not a dead one.
+        return "slow", f"no answer within {timeout:.0f}s (ReadTimeout)"
     except requests.RequestException as e:
-        return False, f"unreachable ({e.__class__.__name__})"
+        return "down", f"unreachable ({e.__class__.__name__})"
 
 
-def check_tcp(target: dict, timeout: float) -> tuple[bool, str]:
+def check_tcp(target: dict, timeout: float) -> tuple[str, str]:
     host = target["host"]
     port = int(target["port"])
     try:
         with socket.create_connection((host, port), timeout=timeout):
-            return True, f"TCP {host}:{port} open"
+            return "up", f"TCP {host}:{port} open"
     except OSError as e:
-        return False, f"TCP {host}:{port} failed ({e.__class__.__name__})"
+        return "down", f"TCP {host}:{port} failed ({e.__class__.__name__})"
 
 
-def run_check(target: dict, timeout: float) -> tuple[bool, str]:
+def check_once(target: dict, timeout: float) -> tuple[str, str]:
     kind = target.get("type", "http").lower()
     if kind == "http":
         return check_http(target, timeout)
     if kind == "tcp":
         return check_tcp(target, timeout)
-    return False, f"unknown check type '{kind}'"
+    return "down", f"unknown check type '{kind}'"
+
+
+def run_check(target: dict, timeout: float, retries: int, delay: float) -> tuple[str, str]:
+    """Check, and on failure retry after `delay` seconds before believing it.
+    Most false alarms are a single blip that is gone 20 s later."""
+    status, detail = check_once(target, timeout)
+    for _ in range(retries):
+        if status == "up":
+            break
+        time.sleep(delay)
+        status, detail = check_once(target, timeout)
+        if status == "up":
+            detail += " (after retry)"
+    return status, detail
 
 
 # ---- alerting -------------------------------------------------------------
@@ -155,15 +197,16 @@ def send_sms(cfg: dict, body: str, max_len: int = 700) -> None:
 
 
 def blank_counters() -> dict:
-    return {"fails": 0, "alerted": False, "day_checks": 0, "day_fails": 0, "day_incidents": 0}
+    return {"fails": 0, "slow": 0, "alerted": False,
+            "day_checks": 0, "day_fails": 0, "day_slow": 0, "day_incidents": 0}
 
 
 # ---- run modes ------------------------------------------------------------
 
 def run_checks(cfg: dict, servers: list, state: dict) -> None:
     defaults = cfg.get("defaults", {})
-    timeout = float(defaults.get("timeout_seconds", 10))
-    threshold = int(defaults.get("failure_threshold", 2))
+    retries = int(defaults.get("retries", 1))
+    delay = float(defaults.get("retry_delay_seconds", 20))
 
     state.setdefault("_summary", {"since": now_label()})
 
@@ -172,25 +215,43 @@ def run_checks(cfg: dict, servers: list, state: dict) -> None:
 
     for target in servers:
         name = target_name(target)
-        ok, detail = run_check(target, timeout)
+        timeout = float(setting(target, defaults, "timeout_seconds", 10))
+        threshold = int(setting(target, defaults, "failure_threshold", 2))
+        slow_threshold = int(setting(target, defaults, "slow_threshold", 6))
+        status, detail = run_check(target, timeout, retries, delay)
 
         st = state.setdefault(name, blank_counters())
         st["day_checks"] = st.get("day_checks", 0) + 1
 
-        if ok:
+        if status == "up":
             if st.get("alerted"):
                 send_sms(cfg, f"RECOVERED: {name} is back up ({detail}).")
-            st["fails"] = 0
+            st["fails"] = st["slow"] = 0
             st["alerted"] = False
             log(f"UP   {name} — {detail}")
+            continue
+
+        # Slow and down both count as "not answering"; down alerts sooner.
+        st["fails"] = st.get("fails", 0) + 1
+        if status == "slow":
+            st["slow"] = st.get("slow", 0) + 1
+            st["day_slow"] = st.get("day_slow", 0) + 1
+            log(f"SLOW {name} — {detail} (consecutive: {st['fails']})")
         else:
-            st["fails"] = st.get("fails", 0) + 1
             st["day_fails"] = st.get("day_fails", 0) + 1
             log(f"DOWN {name} — {detail} (consecutive fails: {st['fails']})")
-            if st["fails"] >= threshold and not st.get("alerted"):
+
+        # A streak of only-slow checks alerts at slow_threshold; any hard
+        # failure in the streak brings it down to failure_threshold.
+        only_slow = st.get("slow", 0) == st["fails"]
+        limit = slow_threshold if only_slow else threshold
+        if st["fails"] >= limit and not st.get("alerted"):
+            if only_slow:
+                send_sms(cfg, f"SLOW: {name} has not answered for ~{st['fails'] * 5} min — {detail}")
+            else:
                 send_sms(cfg, f"DOWN: {name} failed {st['fails']}x — {detail}")
-                st["alerted"] = True
-                st["day_incidents"] = st.get("day_incidents", 0) + 1
+            st["alerted"] = True
+            st["day_incidents"] = st.get("day_incidents", 0) + 1
 
     save_state(state)
 
@@ -213,15 +274,17 @@ def send_summary(cfg: dict, servers: list, state: dict) -> None:
         st = state.get(name, {})
         checks = st.get("day_checks", 0)
         fails = st.get("day_fails", 0)
+        slow = st.get("day_slow", 0)
         incidents = st.get("day_incidents", 0)
         total_incidents += incidents
-        up = checks - fails
+        up = checks - fails - slow
         pct = (up / checks * 100) if checks else 0.0
 
         if incidents or fails or st.get("alerted"):
             all_ok = False
         flag = " DOWN NOW" if st.get("alerted") else ""
         extra = f", {incidents} incident(s)" if incidents else ""
+        extra += f", slow {slow}x" if slow else ""
         lines.append(f"- {name}: {pct:.1f}% ({up}/{checks}){extra}{flag}")
 
     header = ("Server Monitor daily: all systems healthy"
@@ -235,20 +298,51 @@ def send_summary(cfg: dict, servers: list, state: dict) -> None:
     for target in servers:
         st = state.get(target_name(target))
         if st:
-            st["day_checks"] = st["day_fails"] = st["day_incidents"] = 0
+            st["day_checks"] = st["day_fails"] = st["day_slow"] = st["day_incidents"] = 0
     state["_summary"] = {"since": now_label()}
     save_state(state)
 
 
 # ---- main -----------------------------------------------------------------
 
+def single_instance():
+    """Hold an exclusive lock for the whole run. With retries and long timeouts
+    a bad run can outlast the 5-min cron interval; an overlapping run would
+    clobber state.json, so it exits instead. Returns the lock handle, or None
+    if another run holds it. (No-op where fcntl doesn't exist, e.g. Windows.)"""
+    try:
+        import fcntl
+    except ImportError:
+        return True
+    fh = open(HERE / ".monitor.lock", "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    return fh
+
+
 def main() -> None:
+    lock = single_instance()
+    if lock is None:
+        log("previous run still in progress; skipping this one")
+        return
     cfg = load_yaml(CONFIG_FILE)
     set_display_tz(cfg)
+    defaults = cfg.get("defaults", {})
+    trim_log(int(defaults.get("max_log_mb", 5)) * 1024 * 1024)
     servers = load_yaml(SERVERS_FILE).get("servers", [])
     state = load_state()
 
     if "--summary" in sys.argv[1:]:
+        # With defaults.summary_hour set, cron calls --summary at both UTC
+        # hours it could be, and only the one matching local time sends, so
+        # the digest stays at the same local hour across DST changes.
+        hour = defaults.get("summary_hour")
+        if (hour is not None and "--force" not in sys.argv[1:]
+                and datetime.now(DISPLAY_TZ).hour != int(hour)):
+            return
         send_summary(cfg, servers, state)
     else:
         run_checks(cfg, servers, state)

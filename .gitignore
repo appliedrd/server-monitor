@@ -10,6 +10,8 @@ server_monitor.md
 # Runtime artifacts
 state.json
 *.log
+*.log.1
+.monitor.lock
 
 # Python
 venv/

@@ -57,6 +57,16 @@ Note cron fires in the **host's timezone** (GCE default is UTC). Check with
 so use `0 11 * * *`). The summary reads counters accumulated by the 5-min runs,
 then resets them — so keep the regular `*/5` job running too.
 
+**Staying on local time across DST:** set `defaults.timezone` and
+`defaults.summary_hour` in `config.yaml` (e.g. `America/Montreal`, `19`) and
+schedule `--summary` at *both* UTC hours it can fall on. Only the run whose
+local hour matches sends. 19:00 Montreal is 23:00 UTC in summer and 00:00 UTC
+in winter:
+```bash
+0 23,0 * * * $HOME/server-monitor/venv/bin/python $HOME/server-monitor/monitor.py --summary >> $HOME/server-monitor/monitor.log 2>&1
+```
+`--summary --force` sends immediately regardless of the hour.
+
 ## 6. Dead-man's switch (recommended)
 Create a free check at https://healthchecks.io (period ~5 min, grace ~3–5 min),
 paste its ping URL into `config.yaml` → `healthcheck.ping_url`. The monitor pings
@@ -71,5 +81,6 @@ cd ~/server-monitor && git pull          # config.yaml / servers.yaml are gitign
 ---
 ### Notes
 - State lives in `state.json` (auto-created) — consecutive-fail counts persist between cron runs.
-- Logs append to `monitor.log`; add a logrotate rule if it grows.
-- Anti-flapping: an SMS fires only after `failure_threshold` consecutive fails, plus a RECOVERED text when a host comes back.
+- Logs append to `monitor.log`; past `max_log_mb` (default 5) it's moved to `monitor.log.1`, so no logrotate rule is needed.
+- Anti-flapping: a failed check is retried once 20 s later; a DOWN SMS fires only after `failure_threshold` consecutive failed runs, plus a RECOVERED text when a host comes back.
+- Slow vs down: a site that accepts the connection but doesn't answer within the timeout is logged `SLOW`. It texts only after `slow_threshold` consecutive slow runs (default 6 = 30 min) and is counted in the daily summary.

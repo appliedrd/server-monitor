@@ -14,7 +14,14 @@ healthcheck:
   ping_url: "https://hc-ping.com/your-uuid-here"
 
 defaults:
-  timeout_seconds: 10       # per-check timeout
-  failure_threshold: 2      # consecutive failures before an SMS fires (anti-flapping)
+  timeout_seconds: 10       # per-check timeout (override per target in servers.yaml)
+  failure_threshold: 2      # consecutive failed runs before a DOWN SMS (anti-flapping)
+  slow_threshold: 6         # consecutive *slow* runs (connected, no answer in time) before a SLOW SMS
+                            # 6 runs x 5 min = 30 min. Slow runs still show in the daily summary.
+  retries: 1                # re-check a failed target once within the same run...
+  retry_delay_seconds: 20   # ...this many seconds later, before counting it as failed
+  max_log_mb: 5             # monitor.log is moved to monitor.log.1 past this size
   timezone: "UTC"           # display tz for logs + the daily summary, e.g. "America/Montreal".
                             # Display only — does NOT change the host clock or when cron fires.
+  # summary_hour: 19        # local hour (in `timezone`) the daily summary may send at. Lets cron call
+                            # --summary at both UTC hours around a DST change; only the matching one sends.

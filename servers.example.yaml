@@ -9,6 +9,12 @@
 #                      answer 401/403/404/302 to bare requests but are still up.
 #   type: tcp   -> needs `host` + `port`
 # `name` is what shows up in the SMS / log.
+#
+# Optional per-target overrides of the config.yaml defaults:
+#   timeout_seconds, failure_threshold, slow_threshold
+# e.g. a WordPress site that sometimes takes 15 s to answer:
+#   timeout_seconds: 25
+#   slow_threshold: 6
 
 servers:
   - name: Example website
